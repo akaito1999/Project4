@@ -1,0 +1,77 @@
+param (
+    [string]$ResourceGroupName = "acdnd-c4-project",
+    [string]$VMSSName = "udacity-vmss",
+    [string]$AccountId="cc829a8f-4018-45e4-8a71-fce065ac3d8b",
+    [object] $WebhookData
+)
+
+try {
+    # Retrieve the current context
+    $context = Connect-AzAccount -Identity -AccountId $AccountId
+
+    $context = Get-AzContext
+
+    if ($WebhookData) {
+        # Get the data object from WebhookData
+        $WebhookBody = (ConvertFrom-Json -InputObject $WebhookData.RequestBody)
+
+        # Get the info needed to identify the VM (depends on the payload schema)
+        $schemaId = $WebhookBody.schemaId
+        Write-Verbose "schemaId: $schemaId" -Verbose
+        if ($schemaId -eq "azureMonitorCommonAlertSchema") {
+            # This is the common Metric Alert schema (released March 2019)
+            $Essentials = [object] ($WebhookBody.data).essentials
+            # Get the first target only as this script doesn''t handle multiple
+            $alertTargetIdArray = (($Essentials.alertTargetIds)[0]).Split("/")
+            $SubId = ($alertTargetIdArray)[2]
+            $ResourceGroupName = ($alertTargetIdArray)[4]
+            $ResourceType = ($alertTargetIdArray)[6] + "/" + ($alertTargetIdArray)[7]
+            $ResourceName = ($alertTargetIdArray)[-1]
+            $status = $Essentials.monitorCondition
+        } elseif ($schemaId -eq "AzureMonitorMetricAlert") {
+            # This is the near-real-time Metric Alert schema
+            $AlertContext = [object] ($WebhookBody.data).context
+            $SubId = $AlertContext.subscriptionId
+            $ResourceGroupName = $AlertContext.resourceGroupName
+            $ResourceType = $AlertContext.resourceType
+            $ResourceName = $AlertContext.resourceName
+            $status = ($WebhookBody.data).status
+        } elseif ($schemaId -eq "Microsoft.Insights/activityLogs") {
+            # This is the Activity Log Alert schema
+            $AlertContext = [object] (($WebhookBody.data).context).activityLog
+            $SubId = $AlertContext.subscriptionId
+            $ResourceGroupName = $AlertContext.resourceGroupName
+            $ResourceType = $AlertContext.resourceType
+            $ResourceName = (($AlertContext.resourceId).Split("/"))[-1]
+            $status = ($WebhookBody.data).status
+        } elseif ($schemaId -eq $null) {
+            # This is the original Metric Alert schema
+            $AlertContext = [object] $WebhookBody.context
+            $SubId = $AlertContext.subscriptionId
+            $ResourceGroupName = $AlertContext.resourceGroupName
+            $ResourceType = $AlertContext.resourceType
+            $ResourceName = $AlertContext.resourceName
+            $status = $WebhookBody.status
+        } else {
+            # Schema not supported
+            Write-Error "The alert data schema - $schemaId - is not supported."
+        }
+        Write-Verbose "status: $status" -Verbose
+
+        if (($status -eq "Activated") -or ($status -eq "Fired")) {
+            $vmInstances = Get-AzVmssVM -ResourceGroupName $ResourceGroupName -VMScaleSetName $VMSSName -DefaultProfile $context
+
+            Write-Output $vmInstances
+
+            foreach ($instance in $vmInstances) {
+                Stop-AzVmss -ResourceGroupName $ResourceGroupName -VMScaleSetName $VMSSName -InstanceId $instance.InstanceId -DefaultProfile $context -Force
+            }
+
+            Write-Output "Stop all VM successfully." 
+        }
+    }
+} catch {
+    Write-Error "Execute runbook failed: $_"
+
+    return
+}
